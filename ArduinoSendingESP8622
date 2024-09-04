@@ -1,0 +1,307 @@
+#include <ESP8266WiFi.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <ESP8266HTTPClient.h>
+#include <ESP8266WebServer.h>
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+const char* ssid = "Robert 2.4";
+const char* password = "8633989572";
+const char* serverIP = "192.168.1.16"; // Replace with the server's IP address
+
+const int anemometerPin = 2; // GPIO2 (D4 on NodeMCU)
+const int relayPin1 = 14; // GPIO14 (D5 on NodeMCU)
+const int relayPin2 = 12; // GPIO12 (D6 on NodeMCU)
+const int endStopUpPin = 4; // GPIO4 (D2 on NodeMCU)
+const int endStopDownPin = 5; // GPIO5 (D1 on NodeMCU)
+volatile int pulseCount = 0;
+unsigned long lastMillis = 0;
+float windSpeed = 0.0;
+float maxWindSpeed = 0.0;
+float totalWindSpeed = 0.0;
+int sampleCount = 0;
+unsigned long lastDebounceTime = 0;
+const unsigned long debounceDelay = 10; // 10 milliseconds debounce delay
+unsigned long highWindStartTime = 0;
+bool relay1Triggered = false;
+bool relay2Triggered = false;
+unsigned long relay1TriggerTime = 0;
+unsigned long lastHourMillis = 0;
+
+WiFiClient wifiClient;
+bool oledInitialized = false;
+
+// Web server
+ESP8266WebServer server(80);
+
+// Default settings
+float selectedWindSpeed = 10.0; // Default value
+unsigned long triggerDelay = 60000; // Default value (1 minute)
+
+// HTML page with custom image and wind data
+String htmlPage = R"(
+<!DOCTYPE html>
+<html>
+<body>
+  <h2>Wind Speed and Trigger Delay Settings</h2>
+  <img src="https://img1.wsimg.com/isteam/ip/ea0608a4-0564-4932-9b43-489aaaaa595b/maker.PNG/:/rs=h:100,cg:true,m/qt=q:100/ll" alt="Custom Image" style="width:277px;height:100px;"><br><br>
+  <form action="/update" method="POST">
+    <label for="windSpeed">Select Wind Speed (MPH):</label>
+    <select id="windSpeed" name="windSpeed">
+      <option value="5">5</option>
+      <option value="10">10</option>
+      <option value="15">15</option>
+      <option value="20">20</option>
+      <option value="25">25</option>
+    </select><br><br>
+    <label for="delay">Select Trigger Delay:</label>
+    <select id="delay" name="delay">
+      <option value="30000">30 seconds</option>
+      <option value="60000">1 minute</option>
+      <option value="120000">2 minutes</option>
+      <option value="300000">5 minutes</option>
+    </select><br><br>
+    <input type="submit" value="Update">
+  </form>
+  <h2>Current Wind Data</h2>
+  <p>Current Wind Speed: %CURRENT_WIND_SPEED% MPH</p>
+  <p>Average Wind Speed: %AVG_WIND_SPEED% MPH</p>
+  <p>Max Wind Speed: %MAX_WIND_SPEED% MPH</p>
+  <p>Tower Status: %TOWER_STATUS%</p>
+</body>
+</html>
+)";
+
+void IRAM_ATTR countPulse() {
+  unsigned long currentTime = millis();
+  if ((currentTime - lastDebounceTime) > debounceDelay) {
+    pulseCount++;
+    lastDebounceTime = currentTime;
+  }
+}
+
+void handleRoot() {
+  String page = htmlPage;
+  page.replace("%CURRENT_WIND_SPEED%", String(windSpeed));
+  page.replace("%AVG_WIND_SPEED%", String(totalWindSpeed / sampleCount));
+  page.replace("%MAX_WIND_SPEED%", String(maxWindSpeed));
+  
+  String towerStatus;
+  if (digitalRead(endStopUpPin) == LOW) {
+    towerStatus = "UP";
+  } else if (digitalRead(endStopDownPin) == LOW) {
+    towerStatus = "DOWN";
+  } else {
+    towerStatus = "TRANSITION";
+  }
+  page.replace("%TOWER_STATUS%", towerStatus);
+
+  server.send(200, "text/html", page);
+}
+
+void handleUpdate() {
+  if (server.hasArg("windSpeed") && server.hasArg("delay")) {
+    selectedWindSpeed = server.arg("windSpeed").toFloat();
+    triggerDelay = server.arg("delay").toInt();
+    server.send(200, "text/html", "<h2>Settings Updated</h2><a href=\"/\">Go Back</a>");
+  } else {
+    server.send(400, "text/html", "<h2>Invalid Request</h2><a href=\"/\">Go Back</a>");
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(anemometerPin, INPUT_PULLUP);
+  pinMode(relayPin1, OUTPUT);
+  pinMode(relayPin2, OUTPUT);
+  pinMode(endStopUpPin, INPUT_PULLUP);
+  pinMode(endStopDownPin, INPUT_PULLUP);
+  digitalWrite(relayPin1, HIGH); // Ensure relay1 is off initially
+  digitalWrite(relayPin2, HIGH); // Ensure relay2 is off initially
+  attachInterrupt(digitalPinToInterrupt(anemometerPin), countPulse, FALLING);
+
+  // Initialize the OLED display with a timeout
+  unsigned long startMillis = millis();
+  while (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { // Address 0x3C for 128x64
+    if (millis() - startMillis > 2000) { // 2 seconds timeout
+      Serial.println(F("SSD1306 allocation failed"));
+      break;
+    }
+  }
+  if (millis() - startMillis <= 2000) {
+    oledInitialized = true;
+    display.display();
+    delay(500); // Shorter delay
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+    display.print("Connecting to WiFi");
+    display.display();
+  }
+
+  // Connect to WiFi
+  WiFi.begin(ssid, password);
+  if (oledInitialized) {
+    display.setCursor(0, 10);
+    display.print("Connecting to WiFi");
+    display.display();
+  }
+
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("");
+  Serial.println("WiFi connected");
+  Serial.println("IP address: ");
+  Serial.println(WiFi.localIP());
+
+  if (oledInitialized) {
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.print("WiFi Connected");
+    display.setCursor(0, 10);
+    display.print("IP: ");
+    display.print(WiFi.localIP());
+    display.display();
+  }
+
+  // Initialize web server
+  server.on("/", handleRoot);
+  server.on("/update", HTTP_POST, handleUpdate);
+  server.begin();
+  Serial.println("HTTP server started");
+}
+
+void loop() {
+  server.handleClient();
+
+  unsigned long currentMillis = millis();
+  if (currentMillis - lastMillis >= 1000) { // Every second
+    lastMillis = currentMillis;
+    windSpeed = pulseCount * .57; // Convert pulses to MPH
+    pulseCount = 0;
+
+    if (windSpeed > maxWindSpeed) {
+      maxWindSpeed = windSpeed;
+    }
+
+    totalWindSpeed += windSpeed;
+    sampleCount++;
+
+    float avgWindSpeed = totalWindSpeed / sampleCount;
+
+    // Determine tower status
+    String towerStatus;
+    if (digitalRead(endStopUpPin) == LOW) {
+      towerStatus = "UP";
+    } else if (digitalRead(endStopDownPin) == LOW) {
+      towerStatus = "DOWN";
+    } else {
+      towerStatus = "TRANSITION";
+    }
+
+    // Print to Serial Monitor
+    Serial.print("Current Wind Speed: ");
+    Serial.print(windSpeed);
+    Serial.println(" MPH");
+
+    Serial.print("Average Wind Speed: ");
+    Serial.print(avgWindSpeed);
+    Serial.println(" MPH");
+
+    Serial.print("Max Wind Speed: ");
+    Serial.print(maxWindSpeed);
+    Serial.println(" MPH");
+
+    Serial.print("Tower Status: ");
+    Serial.println(towerStatus);
+
+    // Display on OLED
+    if (oledInitialized) {
+      display.clearDisplay();
+      display.setCursor(0, 0);
+      display.print("Wind: ");
+      display.print(windSpeed);
+      display.print(" MPH");
+
+      display.setCursor(0, 10);
+      display.print("Avg: ");
+      display.print(avgWindSpeed);
+      display.print(" MPH");
+
+      display.setCursor(0, 20);
+      display.print("Max: ");
+      display.print(maxWindSpeed);
+      display.print(" MPH");
+
+      display.setCursor(0, 30);
+      display.print("Tower: ");
+      display.print(towerStatus);
+
+      display.display();
+    }
+
+      // Send wind speed and tower status data to server
+    if (WiFi.status() == WL_CONNECTED) {
+      HTTPClient http;
+      String url = String("http://") + serverIP + "/windSpeed?windSpeed=" + windSpeed + "&avgWindSpeed=" + avgWindSpeed + "&maxWindSpeed=" + maxWindSpeed + "&towerStatus=" + towerStatus;
+      http.begin(wifiClient, url); // Use the updated API
+      http.setTimeout(5000); // Set timeout to 5 seconds
+      int httpCode = http.GET();
+      if (httpCode > 0) {
+        String payload = http.getString();
+        Serial.println(payload);
+      }
+      http.end();
+    }
+
+    // Check if wind speed is above the selected threshold and tower is up
+    if (windSpeed > selectedWindSpeed && digitalRead(endStopUpPin) == LOW) {
+      if (!relay1Triggered) {
+        if (highWindStartTime == 0) {
+          highWindStartTime = currentMillis;
+        } else if (currentMillis - highWindStartTime >= triggerDelay) {
+          digitalWrite(relayPin1, LOW); // Trigger relay1
+          relay1Triggered = true;
+          relay1TriggerTime = currentMillis;
+          Serial.println("Relay 1 triggered due to high wind speed.");
+        }
+      }
+    } else {
+      highWindStartTime = 0;
+      if (relay1Triggered) {
+        digitalWrite(relayPin1, HIGH); // Turn off relay1
+        relay1Triggered = false;
+        relay2Triggered = false; // Reset relay2 trigger state
+        Serial.println("Relay 1 turned off due to low wind speed.");
+      }
+    }
+
+    // Trigger relay2 4 seconds after relay1
+    if (relay1Triggered && !relay2Triggered && (currentMillis - relay1TriggerTime >= 4000)) {
+      digitalWrite(relayPin2, LOW); // Trigger relay2
+      relay2Triggered = true;
+      Serial.println("Relay 2 triggered 4 seconds after relay 1.");
+    }
+
+    // Check if an hour has passed
+    if (currentMillis - lastHourMillis >= 3600000) { // 1 hour
+      Serial.print("Max Wind Speed for the Last Hour: ");
+      Serial.print(maxWindSpeed);
+      Serial.println(" MPH");
+
+      // Reset max wind speed for the next hour
+      maxWindSpeed = 0.0;
+      lastHourMillis = currentMillis;
+    }
+  }
+}
