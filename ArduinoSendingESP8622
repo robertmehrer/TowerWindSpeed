@@ -1,24 +1,35 @@
+#define OLED_SCL 5   // GPIO5 corresponds to D1
+#define OLED_SDA 4   // GPIO4 corresponds to D2
+#define EEPROM_WIND_SPEED_ADDR 0
+#define EEPROM_TRIGGER_DELAY_ADDR 4
+
 #include <ESP8266WiFi.h>
 #include <Wire.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
-#include <ESP8266HTTPClient.h>
+#include <U8g2lib.h>
 #include <ESP8266WebServer.h>
+#include <ArduinoJson.h>
+#include <WiFiUdp.h>
+#include <EEPROM.h>
 
-#define SCREEN_WIDTH 128
-#define SCREEN_HEIGHT 64
-#define OLED_RESET    -1
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+const IPAddress staticIP(192, 168, 1, 206);   // Static IP you want to assign
+const IPAddress gateway(192, 168, 1, 1);      // Router IP address (gateway)
+const IPAddress subnet(255, 255, 255, 0);     // Subnet mask
+const char* defaultSSID = "Robert 2.4";
+const char* defaultPassword = "8633989572";
+const char* secondESP_IP = "192.168.1.16"; // IP of the second ESP8266
+const int udpPort = 12345; // Port for UDP communication
+const float windGustThreshold = 15.0; // Wind gust threshold to immediately lower the tower
+const unsigned long relayDelay = 4000; // 4 seconds between relay activations
+const unsigned long relayActivationDuration = 500; // Duration for both relays to stay active (500 ms or adjust as needed)
 
-const char* ssid = "Robert 2.4";
-const char* password = "8633989572";
-const char* serverIP = "192.168.1.16"; // Replace with the server's IP address
+// Initialize U8g2 with GPIO pin definitions
+U8G2_SSD1306_128X64_NONAME_F_SW_I2C u8g2(U8G2_R0, OLED_SCL, OLED_SDA, U8X8_PIN_NONE);
 
 const int anemometerPin = 2; // GPIO2 (D4 on NodeMCU)
-const int relayPin1 = 14; // GPIO14 (D5 on NodeMCU)
-const int relayPin2 = 12; // GPIO12 (D6 on NodeMCU)
-const int endStopUpPin = 4; // GPIO4 (D2 on NodeMCU)
-const int endStopDownPin = 5; // GPIO5 (D1 on NodeMCU)
+const int relayPin1 = 15; // GPIO15 (D8 on NodeMCU)
+const int relayPin2 = 13; // GPIO13 (D7 on NodeMCU)
+const int endStopUpPin = 14;   // GPIO14 (D5)
+const int endStopDownPin = 12; // GPIO12 (D6)
 volatile int pulseCount = 0;
 unsigned long lastMillis = 0;
 float windSpeed = 0.0;
@@ -31,9 +42,11 @@ unsigned long highWindStartTime = 0;
 bool relay1Triggered = false;
 bool relay2Triggered = false;
 unsigned long relay1TriggerTime = 0;
+unsigned long relay2TriggerTime = 0;
 unsigned long lastHourMillis = 0;
 
 WiFiClient wifiClient;
+WiFiUDP udp;
 bool oledInitialized = false;
 
 // Web server
@@ -41,41 +54,156 @@ ESP8266WebServer server(80);
 
 // Default settings
 float selectedWindSpeed = 10.0; // Default value
-unsigned long triggerDelay = 60000; // Default value (1 minute)
+unsigned long triggerDelay = 30000; // Default value (30 seconds)
 
-// HTML page with custom image and wind data
+// Improved HTML page with custom styling and WiFi settings form
 String htmlPage = R"(
 <!DOCTYPE html>
 <html>
+<head>
+  <meta charset="UTF-8">
+  <title>Wind Speed Monitor</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      background: linear-gradient(135deg, #1e2a38, #2b3a4f);
+      color: #f0f0f0;
+      text-align: center;
+      margin: 0;
+      padding: 0;
+    }
+    h2, h3 {
+      color: #4caf50; /* Light green */
+    }
+    .container {
+      width: 90%;
+      margin: 0 auto;
+      max-width: 1200px;
+    }
+    .section {
+      background: rgba(255, 255, 255, 0.1);
+      padding: 20px;
+      border-radius: 12px;
+      box-shadow: 0 4px 8px rgba(0, 0, 0, 0.3);
+      margin-bottom: 20px;
+    }
+    .section h3 {
+      margin-top: 0;
+    }
+    .section p {
+      font-size: 18px;
+      color: #e0e0e0;
+    }
+    select, input[type="submit"], input[type="text"] {
+      font-size: 16px;
+      padding: 10px;
+      margin: 10px 0;
+      border: 1px solid #333;
+      border-radius: 6px;
+      background-color: #333;
+      color: #e0e0e0;
+    }
+    input[type="submit"] {
+      background-color: #4caf50; /* Light green */
+      border: none;
+      cursor: pointer;
+    }
+    input[type="submit"]:hover {
+      background-color: #45a049; /* Darker green */
+    }
+  </style>
+  <script>
+    function fetchWindData() {
+      var xhr = new XMLHttpRequest();
+      xhr.open('GET', '/windData', true);
+      xhr.onload = function() {
+        if (xhr.status === 200) {
+          var data = JSON.parse(xhr.responseText);
+          document.getElementById('currentWindSpeed').innerText = data.currentWindSpeed + ' MPH';
+          document.getElementById('avgWindSpeed').innerText = data.avgWindSpeed + ' MPH';
+          document.getElementById('maxWindSpeed').innerText = data.maxWindSpeed + ' MPH';
+          document.getElementById('towerStatus').innerText = data.towerStatus;
+        }
+      };
+      xhr.send();
+    }
+
+    function fetchSettings() {
+      var xhr = new XMLHttpRequest();
+      xhr.open('GET', '/settings', true);
+      xhr.onload = function() {
+        if (xhr.status === 200) {
+          var settings = JSON.parse(xhr.responseText);
+          document.getElementById('currentWindSpeedSetting').innerText = settings.windSpeed + ' MPH';
+          document.getElementById('currentDelaySetting').innerText = settings.delay / 1000 + ' seconds';
+        }
+      };
+      xhr.send();
+    }
+
+    setInterval(function() {
+      fetchWindData();
+      fetchSettings();
+    }, 1000);
+
+    window.onload = function() {
+      fetchWindData();
+      fetchSettings();
+    };
+  </script>
+</head>
 <body>
-  <h2>Wind Speed and Trigger Delay Settings</h2>
-  <img src="https://img1.wsimg.com/isteam/ip/ea0608a4-0564-4932-9b43-489aaaaa595b/maker.PNG/:/rs=h:100,cg:true,m/qt=q:100/ll" alt="Custom Image" style="width:277px;height:100px;"><br><br>
-  <form action="/update" method="POST">
-    <label for="windSpeed">Select Wind Speed (MPH):</label>
-    <select id="windSpeed" name="windSpeed">
-      <option value="5">5</option>
-      <option value="10">10</option>
-      <option value="15">15</option>
-      <option value="20">20</option>
-      <option value="25">25</option>
-    </select><br><br>
-    <label for="delay">Select Trigger Delay:</label>
-    <select id="delay" name="delay">
-      <option value="30000">30 seconds</option>
-      <option value="60000">1 minute</option>
-      <option value="120000">2 minutes</option>
-      <option value="300000">5 minutes</option>
-    </select><br><br>
-    <input type="submit" value="Update">
-  </form>
-  <h2>Current Wind Data</h2>
-  <p>Current Wind Speed: %CURRENT_WIND_SPEED% MPH</p>
-  <p>Average Wind Speed: %AVG_WIND_SPEED% MPH</p>
-  <p>Max Wind Speed: %MAX_WIND_SPEED% MPH</p>
-  <p>Tower Status: %TOWER_STATUS%</p>
+  <div class="container">
+    <div class="section">
+      <h2>Wind Speed Monitor</h2>
+    </div>
+    <div class="section">
+      <h3>Current Wind Data</h3>
+      <p>Current Wind Speed: <span id="currentWindSpeed">--</span></p>
+      <p>Average Wind Speed: <span id="avgWindSpeed">--</span></p>
+      <p>Max Wind Speed: <span id="maxWindSpeed">--</span></p>
+      <p>Tower Status: <span id="towerStatus">--</span></p>
+    </div>
+    <div class="section">
+      <h3>Settings</h3>
+      <form action="/update" method="POST">
+        <label for="windSpeed">Select Wind Speed (MPH):</label>
+        <select id="windSpeed" name="windSpeed">
+          <option value="5">5</option>
+          <option value="10">10</option>
+          <option value="15">15</option>
+          <option value="20">20</option>
+          <option value="25">25</option>
+        </select><br><br>
+        <label for="delay">Select Trigger Delay:</label>
+        <select id="delay" name="delay">
+          <option value="30000">30 seconds</option>
+          <option value="60000">1 minute</option>
+          <option value="120000">2 minutes</option>
+          <option value="300000">5 minutes</option>
+        </select><br><br>
+        <input type="submit" value="Update Settings">
+      </form>
+      <p>Current Wind Speed Setting: <span id="currentWindSpeedSetting">--</span></p>
+      <p>Current Trigger Delay Setting: <span id="currentDelaySetting">--</span></p>
+    </div>
+    <div class="section">
+      <h3>WiFi Settings</h3>
+      <form action="/wifi" method="POST">
+        <label for="ssid">Enter new SSID:</label>
+        <input type="text" id="ssid" name="ssid" placeholder="Enter new SSID"><br><br>
+        <label for="password">Enter new Password:</label>
+        <input type="text" id="password" name="password" placeholder="Enter new Password"><br><br>
+        <input type="submit" value="Update WiFi">
+      </form>
+    </div>
+  </div>
 </body>
 </html>
 )";
+
+const char* ssid = defaultSSID;
+const char* password = defaultPassword;
 
 void IRAM_ATTR countPulse() {
   unsigned long currentTime = millis();
@@ -87,221 +215,248 @@ void IRAM_ATTR countPulse() {
 
 void handleRoot() {
   String page = htmlPage;
-  page.replace("%CURRENT_WIND_SPEED%", String(windSpeed));
-  page.replace("%AVG_WIND_SPEED%", String(totalWindSpeed / sampleCount));
-  page.replace("%MAX_WIND_SPEED%", String(maxWindSpeed));
-  
+  page.replace("%CURRENT_WIND_SPEED%", String(windSpeed, 2));
+  page.replace("%AVG_WIND_SPEED%", String(totalWindSpeed / sampleCount, 2));
+  page.replace("%MAX_WIND_SPEED%", String(maxWindSpeed, 2));
   String towerStatus;
-  if (digitalRead(endStopUpPin) == LOW) {
+  if (digitalRead(endStopUpPin) == HIGH) {
     towerStatus = "UP";
-  } else if (digitalRead(endStopDownPin) == LOW) {
+  } else if (digitalRead(endStopDownPin) == HIGH) {
     towerStatus = "DOWN";
   } else {
-    towerStatus = "TRANSITION";
+    towerStatus = "MOVING";
   }
   page.replace("%TOWER_STATUS%", towerStatus);
-
+  
   server.send(200, "text/html", page);
 }
 
 void handleUpdate() {
-  if (server.hasArg("windSpeed") && server.hasArg("delay")) {
-    selectedWindSpeed = server.arg("windSpeed").toFloat();
-    triggerDelay = server.arg("delay").toInt();
-    server.send(200, "text/html", "<h2>Settings Updated</h2><a href=\"/\">Go Back</a>");
-  } else {
-    server.send(400, "text/html", "<h2>Invalid Request</h2><a href=\"/\">Go Back</a>");
+  if (server.method() == HTTP_POST) {
+    if (server.hasArg("windSpeed")) {
+      selectedWindSpeed = server.arg("windSpeed").toFloat();
+    }
+    if (server.hasArg("delay")) {
+      triggerDelay = server.arg("delay").toInt();
+    }
+    server.send(200, "text/html", "<html><body><h1>Settings Updated</h1></body></html>");
   }
+}
+
+void handleWiFiUpdate() {
+  if (server.method() == HTTP_POST) {
+    if (server.hasArg("ssid")) {
+      ssid = server.arg("ssid").c_str();
+    }
+    if (server.hasArg("password")) {
+      password = server.arg("password").c_str();
+    }
+    WiFi.disconnect();
+    WiFi.begin(ssid, password);
+    server.send(200, "text/html", "<html><body><h1>WiFi Settings Updated</h1></body></html>");
+  }
+}
+
+void handleWindData() {
+  // Compute the current tower status
+  String towerStatus;
+  if (digitalRead(endStopUpPin) == HIGH) {
+    towerStatus = "UP";
+  } else if (digitalRead(endStopDownPin) == HIGH) {
+    towerStatus = "DOWN";
+  } else {
+    towerStatus = "MOVING";
+  }
+  
+  // Create JSON response
+  String json = "{";
+  json += "\"currentWindSpeed\":" + String(windSpeed, 2) + ",";
+  json += "\"avgWindSpeed\":" + String(totalWindSpeed / sampleCount, 2) + ",";
+  json += "\"maxWindSpeed\":" + String(maxWindSpeed, 2) + ",";
+  json += "\"towerStatus\":\"" + towerStatus + "\"";
+  json += "}";
+  
+  server.send(200, "application/json", json);
+  
+  // Send the data to the second ESP8266
+  udp.beginPacket(secondESP_IP, udpPort);
+  udp.print(json);
+  udp.endPacket();
+}
+
+void handleWeatherData() {
+  String json = "{";
+  json += "\"weather\":\"Sunny\","; // Replace with actual weather data retrieval
+  json += "\"temp\":24,"; // Replace with actual temperature data retrieval
+  json += "\"humidity\":60"; // Replace with actual humidity data retrieval
+  json += "}";
+  server.send(200, "application/json", json);
 }
 
 void setup() {
   Serial.begin(115200);
-  pinMode(anemometerPin, INPUT_PULLUP);
+
+  pinMode(anemometerPin, INPUT);
   pinMode(relayPin1, OUTPUT);
   pinMode(relayPin2, OUTPUT);
   pinMode(endStopUpPin, INPUT_PULLUP);
   pinMode(endStopDownPin, INPUT_PULLUP);
-  digitalWrite(relayPin1, HIGH); // Ensure relay1 is off initially
-  digitalWrite(relayPin2, HIGH); // Ensure relay2 is off initially
-  attachInterrupt(digitalPinToInterrupt(anemometerPin), countPulse, FALLING);
 
-  // Initialize the OLED display with a timeout
-  unsigned long startMillis = millis();
-  while (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { // Address 0x3C for 128x64
-    if (millis() - startMillis > 2000) { // 2 seconds timeout
-      Serial.println(F("SSD1306 allocation failed"));
-      break;
-    }
-  }
-  if (millis() - startMillis <= 2000) {
-    oledInitialized = true;
-    display.display();
-    delay(500); // Shorter delay
-    display.clearDisplay();
-    display.setTextSize(1);
-    display.setTextColor(SSD1306_WHITE);
-    display.setCursor(0, 0);
-    display.print("Connecting to WiFi");
-    display.display();
-  }
+  // Initialize relay pins to LOW to deactivate relays
+  digitalWrite(relayPin1, LOW); // Relay 1 deactivated
+  digitalWrite(relayPin2, HIGH); // Relay 2 deactivated
 
-  // Connect to WiFi
+  attachInterrupt(digitalPinToInterrupt(anemometerPin), countPulse, RISING);
+
+  Serial.println("Starting WiFi connection...");
+
+  // Configuring static IP
+  WiFi.config(staticIP, gateway, subnet);
+
   WiFi.begin(ssid, password);
-  if (oledInitialized) {
-    display.setCursor(0, 10);
-    display.print("Connecting to WiFi");
-    display.display();
-  }
-
   Serial.print("Connecting to WiFi");
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
   }
+  Serial.println("Connected!");
 
-  Serial.println("");
-  Serial.println("WiFi connected");
-  Serial.println("IP address: ");
-  Serial.println(WiFi.localIP());
-
-  if (oledInitialized) {
-    display.clearDisplay();
-    display.setCursor(0, 0);
-    display.print("WiFi Connected");
-    display.setCursor(0, 10);
-    display.print("IP: ");
-    display.print(WiFi.localIP());
-    display.display();
-  }
-
-  // Initialize web server
-  server.on("/", handleRoot);
+  server.on("/", HTTP_GET, handleRoot);
   server.on("/update", HTTP_POST, handleUpdate);
+  server.on("/wifi", HTTP_POST, handleWiFiUpdate);
+  server.on("/windData", HTTP_GET, handleWindData);
+  server.on("/weatherData", HTTP_GET, handleWeatherData);
+
   server.begin();
-  Serial.println("HTTP server started");
+
+  Serial.println("Initializing OLED display...");
+  u8g2.begin();
+  oledInitialized = true;
 }
+
+
+
+
 
 void loop() {
   server.handleClient();
-
+  
   unsigned long currentMillis = millis();
-  if (currentMillis - lastMillis >= 1000) { // Every second
+  
+  // Update wind speed and other metrics every second
+  if (currentMillis - lastMillis >= 1000) { // Update every second
     lastMillis = currentMillis;
-    windSpeed = pulseCount * .57; // Convert pulses to MPH
-    pulseCount = 0;
-
+    
+    // Example calculation for wind speed
+    windSpeed = (pulseCount * 0.57); 
     if (windSpeed > maxWindSpeed) {
       maxWindSpeed = windSpeed;
     }
-
     totalWindSpeed += windSpeed;
     sampleCount++;
-
-    float avgWindSpeed = totalWindSpeed / sampleCount;
-
-    // Determine tower status
+    pulseCount = 0; // Reset pulse count for next interval
+    
+    // Print wind speed data to serial
+    Serial.print("Current Wind Speed: ");
+    Serial.print(windSpeed, 2);
+    Serial.println(" MPH");
+    Serial.print("Average Wind Speed: ");
+    Serial.print(totalWindSpeed / sampleCount, 2);
+    Serial.println(" MPH");
+    Serial.print("Max Wind Speed: ");
+    Serial.print(maxWindSpeed, 2);
+    Serial.println(" MPH");
+    
+    // Print tower status to serial
     String towerStatus;
-    if (digitalRead(endStopUpPin) == LOW) {
+    if (digitalRead(endStopUpPin) == HIGH) {
       towerStatus = "UP";
-    } else if (digitalRead(endStopDownPin) == LOW) {
+    } else if (digitalRead(endStopDownPin) == HIGH) {
       towerStatus = "DOWN";
     } else {
-      towerStatus = "TRANSITION";
+      towerStatus = "MOVING";
     }
-
-    // Print to Serial Monitor
-    Serial.print("Current Wind Speed: ");
-    Serial.print(windSpeed);
-    Serial.println(" MPH");
-
-    Serial.print("Average Wind Speed: ");
-    Serial.print(avgWindSpeed);
-    Serial.println(" MPH");
-
-    Serial.print("Max Wind Speed: ");
-    Serial.print(maxWindSpeed);
-    Serial.println(" MPH");
-
     Serial.print("Tower Status: ");
     Serial.println(towerStatus);
-
-    // Display on OLED
+    
+    // Update the OLED display
     if (oledInitialized) {
-      display.clearDisplay();
-      display.setCursor(0, 0);
-      display.print("Wind: ");
-      display.print(windSpeed);
-      display.print(" MPH");
-
-      display.setCursor(0, 10);
-      display.print("Avg: ");
-      display.print(avgWindSpeed);
-      display.print(" MPH");
-
-      display.setCursor(0, 20);
-      display.print("Max: ");
-      display.print(maxWindSpeed);
-      display.print(" MPH");
-
-      display.setCursor(0, 30);
-      display.print("Tower: ");
-      display.print(towerStatus);
-
-      display.display();
+      u8g2.clearBuffer(); // Clear the internal memory
+      u8g2.setFont(u8g2_font_ncenB08_tr);
+      u8g2.setCursor(0, 10);
+      u8g2.print("Wind Speed: ");
+      u8g2.print(windSpeed, 2);
+      u8g2.print(" MPH");
+      u8g2.setCursor(0, 20);
+      u8g2.print("Avg Speed: ");
+      u8g2.print(totalWindSpeed / sampleCount, 2);
+      u8g2.print(" MPH");
+      u8g2.setCursor(0, 30);
+      u8g2.print("Max Speed: ");
+      u8g2.print(maxWindSpeed, 2);
+      u8g2.print(" MPH");
+      u8g2.setCursor(0, 40);
+      u8g2.print("Tower Status: ");
+      u8g2.print(towerStatus);
+      u8g2.setCursor(0, 50);
+      u8g2.print("IP: ");
+      u8g2.print(WiFi.localIP().toString());
+      u8g2.sendBuffer(); // Transfer internal memory to the display
     }
-
-      // Send wind speed and tower status data to server
-    if (WiFi.status() == WL_CONNECTED) {
-      HTTPClient http;
-      String url = String("http://") + serverIP + "/windSpeed?windSpeed=" + windSpeed + "&avgWindSpeed=" + avgWindSpeed + "&maxWindSpeed=" + maxWindSpeed + "&towerStatus=" + towerStatus;
-      http.begin(wifiClient, url); // Use the updated API
-      http.setTimeout(5000); // Set timeout to 5 seconds
-      int httpCode = http.GET();
-      if (httpCode > 0) {
-        String payload = http.getString();
-        Serial.println(payload);
-      }
-      http.end();
-    }
-
-    // Check if wind speed is above the selected threshold and tower is up
-    if (windSpeed > selectedWindSpeed && digitalRead(endStopUpPin) == LOW) {
-      if (!relay1Triggered) {
-        if (highWindStartTime == 0) {
-          highWindStartTime = currentMillis;
-        } else if (currentMillis - highWindStartTime >= triggerDelay) {
-          digitalWrite(relayPin1, LOW); // Trigger relay1
-          relay1Triggered = true;
+    
+    // Check if wind speed is sustained at or above 10 MPH for triggerDelay duration
+    if (windSpeed >= selectedWindSpeed) {
+      if (highWindStartTime == 0) {
+        highWindStartTime = currentMillis;
+      } else if (currentMillis - highWindStartTime >= triggerDelay) { // Trigger Delay
+        if (!relay1Triggered) {
+          digitalWrite(relayPin1, LOW); // Activate Relay 1
+          Serial.println("Relay 1 Activated");
           relay1TriggerTime = currentMillis;
-          Serial.println("Relay 1 triggered due to high wind speed.");
+          relay1Triggered = true;
+        }
+        if (relay1Triggered && (currentMillis - relay1TriggerTime >= relayDelay)) { // 4 second delay for Relay 2
+          if (!relay2Triggered) {
+            digitalWrite(relayPin2, LOW); // Activate Relay 2
+            Serial.println("Relay 2 Activated");
+            relay2TriggerTime = currentMillis;
+            relay2Triggered = true;
+          }
         }
       }
     } else {
-      highWindStartTime = 0;
-      if (relay1Triggered) {
-        digitalWrite(relayPin1, HIGH); // Turn off relay1
-        relay1Triggered = false;
-        relay2Triggered = false; // Reset relay2 trigger state
-        Serial.println("Relay 1 turned off due to low wind speed.");
+      highWindStartTime = 0; // Reset the timer if wind speed drops below threshold
+    }
+    
+    // Check if wind gusts to 15 MPH or more, and immediately lower the tower
+    if (windSpeed >= windGustThreshold) {
+      if (!relay1Triggered) {
+        digitalWrite(relayPin1, LOW); // Immediately activate Relay 1
+        Serial.println("Relay 1 Activated due to gust");
+        relay1TriggerTime = currentMillis;
+        relay1Triggered = true;
+      }
+      if (relay1Triggered && (currentMillis - relay1TriggerTime >= relayDelay)) { // 4 second delay for Relay 2
+        if (!relay2Triggered) {
+          digitalWrite(relayPin2, LOW); // Activate Relay 2
+          Serial.println("Relay 2 Activated due to gust");
+          relay2TriggerTime = currentMillis;
+          relay2Triggered = true;
+        }
       }
     }
-
-    // Trigger relay2 4 seconds after relay1
-    if (relay1Triggered && !relay2Triggered && (currentMillis - relay1TriggerTime >= 4000)) {
-      digitalWrite(relayPin2, LOW); // Trigger relay2
-      relay2Triggered = true;
-      Serial.println("Relay 2 triggered 4 seconds after relay 1.");
+    
+    // Handle relay deactivation
+    if (relay1Triggered && (currentMillis - relay1TriggerTime >= relayActivationDuration)) {
+      digitalWrite(relayPin1, HIGH); // Deactivate Relay 1
+      Serial.println("Relay 1 Deactivated");
+      relay1Triggered = false;
     }
-
-    // Check if an hour has passed
-    if (currentMillis - lastHourMillis >= 3600000) { // 1 hour
-      Serial.print("Max Wind Speed for the Last Hour: ");
-      Serial.print(maxWindSpeed);
-      Serial.println(" MPH");
-
-      // Reset max wind speed for the next hour
-      maxWindSpeed = 0.0;
-      lastHourMillis = currentMillis;
+    
+    if (relay2Triggered && (currentMillis - relay2TriggerTime >= relayActivationDuration)) {
+      digitalWrite(relayPin2, HIGH); // Deactivate Relay 2
+      Serial.println("Relay 2 Deactivated");
+      relay2Triggered = false;
     }
   }
 }
